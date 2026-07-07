@@ -2,6 +2,14 @@
 
 Imagen Docker de PostgreSQL 16 para la capa de datos del sistema **Alumnos**. Incluye inicialización automática del esquema y datos de ejemplo listos para desarrollo.
 
+> **Proyecto EFT — ISY1101 Introducción a Herramientas DevOps (Duoc UC)**
+> Este repositorio es uno de los tres componentes del sistema **Gestor de Alumnos**, desplegado en **Amazon EKS**:
+> - 🗄️ Base de datos (este repo): **ep03-database**
+> - ⚙️ Backend: [ep03-backend](https://github.com/ikevin-p/ep03-backend)
+> - 🖥️ Frontend: [ep03-frontend](https://github.com/ikevin-p/ep03-frontend)
+>
+> Guía del curso: [ISY1101-003V_EP03 · guia-04](https://github.com/mauriciovelasquezduoc/ISY1101-003V_EP03/tree/main/guia-04)
+
 ---
 
 ## Contenido
@@ -224,120 +232,79 @@ docker push <ECR_REGISTRY>/ep03-db:latest
 
 ## Contexto en la arquitectura
 
-Esta imagen forma parte de la infraestructura de 3 capas del sistema Alumnos:
+Este servicio forma parte de la arquitectura de 3 capas del sistema **Gestor de Alumnos**, desplegada en un clúster **Amazon EKS** (`laboratorio-ep03-eks`), dentro del namespace `ep03`:
 
 ```
-Internet
+Usuario
    |
-EC2-Web  (ep03-frontend:latest)    — Capa Web    — Puerto 80
+AWS ELB (Load Balancer publico)
    |
-EC2-App  (ep03-backend:latest)    — Capa App    — Puerto 8080
+Frontend  (Service: ep03-frontend, LoadBalancer) — Nginx :80
    |
-EC2-Datos (ep03-db:latest) — Capa Datos  — Puerto 5432  <-- este servicio
+Backend   (Service: ep03-backend, ClusterIP) — Spring Boot :8080
+   |  JDBC
+Database  (Service: ep03-database, ClusterIP) — PostgreSQL :5432   <-- este servicio
 ```
 
-- Solo accesible desde la capa App (SG-Datos permite TCP 5432 unicamente desde SG-App)
-- Desplegada en `Subnet-Datos` sin acceso a internet
-- Acceso a ECR y SSM por VPC Endpoints privados
-
----
+- Desplegada como `Deployment` de Kubernetes (`ep03-database`) con `strategy: Recreate` y 1 réplica — no forma parte del autoescalado horizontal (HPA), ya que es una instancia única de base de datos en este proyecto de laboratorio.
+- Expuesta únicamente vía `Service` tipo `ClusterIP` (`ep03-database:5432`): sin IP pública ni acceso directo desde internet, solo alcanzable desde dentro del namespace `ep03` (en la práctica, solo el backend se conecta a ella).
+- La contraseña de PostgreSQL se gestiona como `Secret` de Kubernetes (`database-secret`), referenciada por el `Deployment` vía `secretKeyRef` — nunca en texto plano en el manifiesto.
+- `readinessProbe`/`livenessProbe` de tipo `tcpSocket` sobre el puerto 5432, para que Kubernetes solo enrute tráfico al pod cuando el motor de base de datos esté aceptando conexiones.
+- Los datos usan `emptyDir` como volumen en este entorno de laboratorio: al recrearse el pod, el esquema se reinicializa automáticamente desde `init.sql`. En un entorno productivo real se reemplazaría por un volumen persistente (`PersistentVolumeClaim`).
 
 ## Notas de seguridad
 
-- Las credenciales por defecto son solo para desarrollo local. En produccion usar AWS Secrets Manager o variables de entorno inyectadas en el pipeline.
-- En el despliegue AWS, las credenciales se pasan como variables de entorno al contenedor desde el script `deploy-datos.sh` via SSM.
-- El puerto 5432 no debe exponerse publicamente en ningun entorno.
+- Las credenciales por defecto del `Dockerfile`/`docker-compose.yml` son solo para desarrollo local.
+- En el clúster EKS, la contraseña de PostgreSQL se inyecta exclusivamente desde un `Secret` de Kubernetes (`database-secret`), nunca como variable de entorno en texto plano en el `Deployment`.
+- El puerto 5432 no se expone públicamente en ningún entorno: en EKS, el `Service` es `ClusterIP` (solo red interna del clúster).
 
 ---
 
 ## CI/CD — GitHub Actions
 
-El pipeline esta definido en `.github/workflows/ci.yml` y se ejecuta automaticamente en cada `push` a cualquier rama. Orquesta tres jobs secuenciales que cubren el ciclo completo: versionado semantico, publicacion en ECR y despliegue en AWS.
-
-### Trigger
-
-```
-push → cualquier rama (**)
-```
+El pipeline está definido en [`.github/workflows/deploy-database-eks.yml`](.github/workflows/deploy-database-eks.yml) y se ejecuta automáticamente en cada `push` a `main` (también soporta `workflow_dispatch` manual). Orquesta tres jobs secuenciales: versionado semántico, publicación en ECR y despliegue en **Amazon EKS**.
 
 ### Flujo del pipeline
 
 ```mermaid
 flowchart LR
-    A["versioning\nCalcula y crea tag git"] -->|new_tag| B["build-push-ecr\nConstruye y publica en ECR"]
-    B -->|imagen lista| C["deploy\nDespliega en EC2-Datos via SSM"]
+    A["versioning\nCalcula y crea tag v1.x.0"] -->|new_tag| B["build-push-ecr\nConstruye y publica en ECR"]
+    B -->|imagen lista| C["deploy\nkubectl set image -> EKS"]
 ```
 
 ### Job 1 — Versioning
 
-Calcula automaticamente la siguiente version semantica con esquema `v1.x.0` y crea el tag en el repositorio.
-
-**Logica de calculo:**
-- Busca el ultimo tag existente con patron `v1.*`
-- Si no existe ningun tag, inicia en `v1.0.0`
-- Si existe, incrementa el numero menor: `v1.3.0` → `v1.4.0`
-- Crea y publica el tag en el repositorio con `github-actions[bot]`
-
-**Output:** `new_tag` — utilizado por los jobs siguientes como identificador de version.
-
----
+Calcula automáticamente la siguiente versión semántica (`v1.x.0`): busca el último tag `v1.*`, incrementa el número menor (o inicia en `v1.0.0` si no existe ninguno) y publica el tag con `github-actions[bot]`.
 
 ### Job 2 — Build & Push ECR
 
-Construye la imagen Docker desde el `Dockerfile` e `init.sql`, y la publica en Amazon ECR con dos tags simultaneos.
-
-**Pasos:**
-1. Configura credenciales AWS desde los secrets del repositorio
-2. Autentica en Amazon ECR
-3. Construye la imagen con Docker Buildx (soporte multi-plataforma y cache)
-4. Publica con dos tags:
-   - `v1.x.0` — version inmutable para trazabilidad
-   - `latest` — apuntando siempre a la version mas reciente
-
-**Cache:** utiliza GitHub Actions Cache (`type=gha`) para reutilizar capas entre ejecuciones y reducir el tiempo de build.
+Construye la imagen Docker (incluye `init.sql`) y la publica en Amazon ECR con dos tags simultáneos:
 
 | Tag publicado | Ejemplo | Uso |
 |---|---|---|
-| Version semantica | `ep03-db:v1.4.0` | Rollback, trazabilidad |
-| Latest | `ep03-db:latest` | Despliegue automatico |
+| Versión semántica | `ep03-database:v1.4.0` | Trazabilidad histórica |
+| `latest` | `ep03-database:latest` | Tag usado por el paso de despliegue |
 
----
+Usa GitHub Actions Cache (`type=gha`) para reutilizar capas Docker entre ejecuciones.
 
-### Job 3 — Deploy via SSM
+### Job 3 — Deploy a EKS
 
-Despliega la nueva imagen en la instancia `EC2-Datos` sin necesidad de acceso SSH directo. La instancia esta en una subnet privada sin acceso a internet — la comunicacion se realiza exclusivamente a traves de **VPC Endpoints de SSM**.
+1. Configura credenciales AWS temporales (Learner Lab) y genera el `kubeconfig` con `aws eks update-kubeconfig --name laboratorio-ep03-eks`.
+2. Elimina el pod actual de base de datos para forzar su recreación con las probes/configuración más recientes.
+3. Actualiza la imagen del `Deployment`: `kubectl set image deployment/ep03-database database=<ECR>/ep03-database:latest -n ep03`.
+4. Espera (con polling, máx. 5 minutos) a que el pod quede en estado `Running`; si entra en `ImagePullBackOff`, `ErrImagePull` o `CrashLoopBackOff`, el job falla e imprime los comandos de diagnóstico sugeridos.
+5. Verifica el estado final: pods, `Service` y últimas líneas de logs.
 
-**Pasos:**
-1. Obtiene el Instance ID de `EC2-Datos` desde **SSM Parameter Store** (`/ep03/ec2/datos`)
-2. Envia el comando `deploy-datos.sh` a la instancia via `AWS-RunShellScript`
-3. Hace polling del estado del comando cada 10 segundos (maximo 5 minutos / 30 intentos)
-4. Si el comando termina en `Success`, imprime el output y el job finaliza exitosamente
-5. Si termina en `Failed`, `TimedOut` o `Cancelled`, imprime el error y el job falla
+### Secrets requeridos (GitHub Secrets)
 
-**Comportamiento del deploy en EC2-Datos:**
-- Detiene y elimina el contenedor anterior
-- Hace pull de `ep03-db:latest` desde ECR via VPC Endpoint
-- Recrea el contenedor — los datos se reinician desde `init.sql`
-
-> El reinicio de datos en cada deploy es intencional para este entorno de laboratorio. En produccion se omite el `rm -rf pgdata` para preservar los datos existentes.
-
----
-
-### Secrets requeridos
-
-| Secret | Descripcion |
+| Secret | Descripción |
 | ------ | ----------- |
-| `AWS_ACCESS_KEY_ID` | Credencial de acceso AWS |
-| `AWS_SECRET_ACCESS_KEY` | Clave secreta AWS |
-| `AWS_SESSION_TOKEN` | Token de sesion AWS (Lab Academy) |
-| `AWS_REGION` | Region AWS (`us-east-1`) |
+| `AWS_ACCESS_KEY_ID` / `AWS_SECRET_ACCESS_KEY` / `AWS_SESSION_TOKEN` | Credenciales temporales del AWS Academy Learner Lab |
+| `AWS_REGION` | `us-east-1` |
+| `EKS_CLUSTER_NAME` | `laboratorio-ep03-eks` |
 
-### Resumen de ejecucion
+### Permisos del workflow
 
-Al finalizar cada job, el pipeline publica un resumen en la interfaz de GitHub Actions con la version desplegada, el ID de la instancia y el estado del contenedor.
-
-### Permisos
-
-| Permiso | Nivel | Razon |
+| Permiso | Nivel | Razón |
 | ------- | ----- | ----- |
 | `contents: write` | Repositorio | Crear y publicar tags git |
